@@ -1,13 +1,4 @@
-"""
-Beatpull - a Spotify-style downloader + player.
 
-Two tabs:
-  * Download - paste a link, pick MP3/MP4, pull it down (yt-dlp + ffmpeg).
-  * Library  - your downloaded tracks with thumbnails; click one to play it.
-
-Styling lives in the STYLE string near the bottom - it reads like CSS, so the
-colors and gradient are easy to tweak.
-"""
 
 import json
 import math
@@ -50,14 +41,8 @@ from PySide6.QtWidgets import (
 
 vol1, vol2 = .25, 25
 
-# BPM/key analysis needs librosa. We only check if it's importable here (fast);
-# the heavy import happens inside the worker thread when we actually analyze.
-import importlib.util
-ANALYSIS_AVAILABLE = importlib.util.find_spec("librosa") is not None
+# library index 
 
-# ---------------------------------------------------------------------------
-# Where we keep the library index (a small JSON list of everything downloaded)
-# ---------------------------------------------------------------------------
 DATA_DIR = os.path.join(os.path.expanduser("~"), ".beatpull")
 LIBRARY_JSON = os.path.join(DATA_DIR, "library.json")
 THUMBS_DIR = os.path.join(DATA_DIR, "thumbs")
@@ -88,13 +73,11 @@ def save_store(store):
         json.dump(store, f, indent=2)
 
 
-# ---------------------------------------------------------------------------
-# App settings (persisted between sessions)
-# ---------------------------------------------------------------------------
+# App settings
 SETTINGS_JSON = os.path.join(DATA_DIR, "settings.json")
 DEFAULT_SETTINGS = {
     "out_dir": os.path.join(os.path.expanduser("~"), "Downloads"),
-    "format": "mp3",            # "mp3" or "mp4"
+    "format": "mp3",            
     "quality_mp3": "192",
     "quality_mp4": "1080",
     "volume": 80,
@@ -102,7 +85,7 @@ DEFAULT_SETTINGS = {
     "win_h": 700,
     "reduce_motion": False,
     "star_density": 230,
-    "sort_mode": "added",       # added / title / artist / duration
+    "sort_mode": "added",      
     "last_file": "",
 }
 
@@ -136,19 +119,17 @@ def fmt_time(ms):
     return f"{s // 60}:{s % 60:02d}"
 
 
-# ---------------------------------------------------------------------------
 # Worker: downloads on a background thread and also grabs a thumbnail + info
-# ---------------------------------------------------------------------------
 class DownloadWorker(QThread):
     progress = Signal(float)
     log = Signal(str)
-    finished_ok = Signal(dict)   # one library entry (may fire many times)
+    finished_ok = Signal(dict)   
     failed = Signal(str)
-    all_done = Signal(int)       # total items added when the batch finishes
+    all_done = Signal(int)       
 
     def __init__(self, urls, fmt, quality, out_dir, allow_playlist=False):
         super().__init__()
-        self.urls = urls          # list of URLs
+        self.urls = urls         
         self.fmt = fmt
         self.quality = quality
         self.out_dir = out_dir
@@ -188,7 +169,7 @@ class DownloadWorker(QThread):
                 f"best[height<={h}]/best"
             )
             opts["merge_output_format"] = "mp4"
-        # jpg thumbnail (Qt reads jpg), embed cover art into the file, write tags
+        # jpg thumbnail
         opts["postprocessors"].append(
             {"key": "FFmpegThumbnailsConvertor", "format": "jpg"})
         opts["postprocessors"].append(
@@ -271,9 +252,7 @@ class DownloadWorker(QThread):
         self.all_done.emit(added)
 
 
-# ---------------------------------------------------------------------------
-# Preview worker: fetches title / uploader / duration / thumbnail (no download)
-# ---------------------------------------------------------------------------
+# Preview worker
 class PreviewWorker(QThread):
     done = Signal(dict)
     failed = Signal(str)
@@ -307,49 +286,57 @@ class PreviewWorker(QThread):
             self.failed.emit(str(e))
 
 
-# ---------------------------------------------------------------------------
-# Analysis worker: estimates BPM (tempo) and musical key for an audio file
-# ---------------------------------------------------------------------------
-class AnalyzeWorker(QThread):
-    done = Signal(str, float, str)   # file path, bpm, key ("" if it failed)
+# Lyrics worker
+class LyricsWorker(QThread):
+    done = Signal(str)
 
-    KEYS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-    # Krumhansl-Schmuckler key profiles
-    MAJ = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
-    MIN = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
-
-    def __init__(self, path):
+    def __init__(self, artist, title):
         super().__init__()
-        self.path = path
+        self.artist = artist or ""
+        self.title = title or ""
+
+    @staticmethod
+    def _clean(s):
+        import re
+        s = re.sub(r"\[[^\]]*\]", "", s)               # [Official Video]
+        s = re.sub(r"\((?:[^)]*?(?:official|lyric|audio|video|hd|4k|"
+                   r"visualizer|mv|m/v)[^)]*)\)", "", s, flags=re.I)
+        s = re.sub(r"(?i)\b(official (music )?video|official audio|"
+                   r"lyrics?|music video|audio)\b", "", s)
+        s = re.sub(r"\s{2,}", " ", s)
+        return s.strip(" -–—|")
+
+    @staticmethod
+    def _fetch(artist, title):
+        import urllib.request
+        import urllib.parse
+        url = ("https://api.lyrics.ovh/v1/"
+               f"{urllib.parse.quote(artist)}/{urllib.parse.quote(title)}")
+        with urllib.request.urlopen(url, timeout=12) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        return (data.get("lyrics") or "").strip()
 
     def run(self):
-        try:
-            import librosa
-            import numpy as np
-            # first ~90s is plenty for tempo/key and keeps it fast
-            y, sr = librosa.load(self.path, mono=True, duration=90)
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-            bpm = float(round(float(np.atleast_1d(tempo)[0])))
-
-            chroma = librosa.feature.chroma_cqt(y=y, sr=sr).mean(axis=1)
-            maj = np.array(self.MAJ)
-            minor = np.array(self.MIN)
-            best_corr, best = -2.0, ""
-            for i in range(12):
-                cm = np.corrcoef(chroma, np.roll(maj, i))[0, 1]
-                ci = np.corrcoef(chroma, np.roll(minor, i))[0, 1]
-                if cm > best_corr:
-                    best_corr, best = cm, f"{self.KEYS[i]} major"
-                if ci > best_corr:
-                    best_corr, best = ci, f"{self.KEYS[i]} minor"
-            self.done.emit(self.path, bpm, best)
-        except Exception:
-            self.done.emit(self.path, 0.0, "")
+        title = self._clean(self.title)
+        artist = self._clean(self.artist)
+        attempts = [(artist, title)]
+        if " - " in title:
+            a, t = title.split(" - ", 1)
+            attempts.append((self._clean(a), self._clean(t)))
+        for a, t in attempts:
+            if not a or not t:
+                continue
+            try:
+                lyr = self._fetch(a, t)
+                if lyr:
+                    self.done.emit(lyr)
+                    return
+            except Exception:
+                continue
+        self.done.emit("")
 
 
-# ---------------------------------------------------------------------------
 # Download tab
-# ---------------------------------------------------------------------------
 class DownloadTab(QWidget):
     track_added = Signal(dict)
 
@@ -367,9 +354,6 @@ class DownloadTab(QWidget):
         return lbl
 
     def _build(self):
-        # A scroll area so the form never compresses/overlaps in short windows;
-        # inside it, a fixed-max-width panel is centered so nothing stretches
-        # edge-to-edge in fullscreen.
         page = QVBoxLayout(self)
         page.setContentsMargins(0, 0, 0, 0)
         page.setSpacing(0)
@@ -415,7 +399,7 @@ class DownloadTab(QWidget):
         link_row.setSpacing(10)
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText(
-            "Paste a link separated by spaces")
+            "Paste a link, or more by separating with spaces")
         self.url_input.returnPressed.connect(self._preview)
         link_row.addWidget(self.url_input, 1)
         self.preview_btn = QPushButton("Preview")
@@ -428,7 +412,6 @@ class DownloadTab(QWidget):
         self.playlist_chk.setObjectName("chk")
         cl.addWidget(self.playlist_chk)
 
-        # preview panel (hidden until you fetch)
         self.preview_box = QFrame()
         self.preview_box.setObjectName("previewBox")
         self.preview_box.hide()
@@ -476,7 +459,6 @@ class DownloadTab(QWidget):
         row.addLayout(qbox, 1)
         cl.addLayout(row)
         self._on_format_change(self.fmt_select.currentIndex())
-        # restore last quality choice
         q = SETTINGS.get("quality_mp4" if SETTINGS.get("format") == "mp4"
                          else "quality_mp3")
         if q:
@@ -627,7 +609,6 @@ class DownloadTab(QWidget):
         self._reset()
 
     def _error(self, msg):
-        # a single item failed; the batch keeps going, so don't reset here
         self._log(f"Error: {msg}")
 
     def _reset(self):
@@ -635,9 +616,7 @@ class DownloadTab(QWidget):
         self.download_btn.setText("Download")
 
 
-# ---------------------------------------------------------------------------
 # A single row in the library list
-# ---------------------------------------------------------------------------
 class TrackRow(QFrame):
     def __init__(self, entry, owner):
         super().__init__()
@@ -664,10 +643,14 @@ class TrackRow(QFrame):
         info.setSpacing(2)
         t = QLabel(entry["title"])
         t.setObjectName("rowTitle")
-        self.sub_label = QLabel(self._subtitle(entry))
-        self.sub_label.setObjectName("rowArtist")
+        cats = entry.get("categories") or []
+        sub = f"{entry['artist']}  ·  {entry['format'].upper()}"
+        if cats:
+            sub += "  ·  " + ", ".join(cats)
+        a = QLabel(sub)
+        a.setObjectName("rowArtist")
         info.addWidget(t)
-        info.addWidget(self.sub_label)
+        info.addWidget(a)
         lay.addLayout(info)
         lay.addStretch()
 
@@ -690,21 +673,6 @@ class TrackRow(QFrame):
         delete.setFixedWidth(40)
         delete.clicked.connect(lambda: owner.delete_track(entry))
         lay.addWidget(delete)
-
-    @staticmethod
-    def _subtitle(entry):
-        parts = [entry.get("artist", ""), entry.get("format", "").upper()]
-        if entry.get("bpm"):
-            parts.append(f"{int(entry['bpm'])} BPM")
-        if entry.get("key"):
-            parts.append(entry["key"])
-        cats = entry.get("categories") or []
-        if cats:
-            parts.append(", ".join(cats))
-        return "  ·  ".join(p for p in parts if p)
-
-    def update_meta(self):
-        self.sub_label.setText(self._subtitle(self.entry))
 
     def set_playing(self, playing):
         self.setProperty("playing", "true" if playing else "false")
@@ -745,10 +713,6 @@ class TrackRow(QFrame):
         ren.triggered.connect(lambda: self.owner.rename_track(self.entry))
         menu.addAction(ren)
 
-        analyze = QAction("Analyze BPM & key", self)
-        analyze.triggered.connect(lambda: self.owner.analyze_entry(self.entry))
-        menu.addAction(analyze)
-
         menu.addSeparator()
         dele = QAction("Remove from library", self)
         dele.triggered.connect(lambda: self.owner.delete_track(self.entry))
@@ -756,9 +720,7 @@ class TrackRow(QFrame):
         menu.exec(event.globalPos())
 
 
-# ---------------------------------------------------------------------------
-# Sidebar - now-playing panel with a blurred album-art background
-# ---------------------------------------------------------------------------
+# Sidebar 
 class Sidebar(QFrame):
     def __init__(self):
         super().__init__()
@@ -801,35 +763,32 @@ class Sidebar(QFrame):
             self.scrim.hide()
 
     def _first_content(self):
-        # the scrim must sit under the real content widgets
         for c in self.children():
             if isinstance(c, QWidget) and c not in (self.bg, self.scrim):
                 return c
         return self.scrim
 
 
-# ---------------------------------------------------------------------------
 # Library tab: now-playing sidebar + track list
-# ---------------------------------------------------------------------------
 class LibraryTab(QWidget):
     def __init__(self):
         super().__init__()
         self.store = load_store()
-        self._prune_missing()            # drop entries whose file is gone
-        self._migrate()                  # upgrade old entries to tags/favorites
-        self.current_filter = None       # None = "All", "__fav__" = favorites
+        self._prune_missing()            
+        self._migrate()                 
+        self.current_filter = None       
         self.search_text = ""
         self.sort_mode = SETTINGS.get("sort_mode", "added")
-        self.now_file = None             # file of the currently playing track
-        self.rows = []                   # TrackRow widgets currently shown
-        self.play_order = []             # entries in current play queue
+        self.now_file = None            
+        self.rows = []                  
+        self.play_order = []             
         self.play_index = -1
         self.shuffle = False
-        self.repeat = 0                  # 0 = off, 1 = all, 2 = one
+        self.repeat = 0                 
         self._accent = QColor("#453aa8")
-        self._analyze_workers = []       # keep refs so threads aren't GC'd
-        self._analyze_queue = []         # entries waiting for BPM/key analysis
-        self._analyzing = False
+        self.lworker = None
+        self.current_lyrics = ""
+        self._lyrics_seq = 0
         self.player = QMediaPlayer()
         self.audio = QAudioOutput()
         self.player.setAudioOutput(self.audio)
@@ -844,11 +803,6 @@ class LibraryTab(QWidget):
         self._refresh_list()
         self._refresh_categories_page()
         self._resume_last()
-        # analyze any tracks that don't yet have BPM/key (in the background)
-        if ANALYSIS_AVAILABLE:
-            for t in self.store["tracks"]:
-                if not t.get("bpm"):
-                    self._enqueue_analysis(t)
 
     def _resume_last(self):
         last = SETTINGS.get("last_file")
@@ -975,8 +929,14 @@ class LibraryTab(QWidget):
         self.repeat_btn.setObjectName("chip")
         self.repeat_btn.setCheckable(True)
         self.repeat_btn.clicked.connect(self._cycle_repeat)
+        self.lyrics_btn = QPushButton("Lyrics")
+        self.lyrics_btn.setObjectName("chip")
+        self.lyrics_btn.setEnabled(False)
+        self.lyrics_btn.setToolTip("Show lyrics for the current song")
+        self.lyrics_btn.clicked.connect(self._show_lyrics)
         mode_row.addWidget(self.shuffle_btn)
         mode_row.addWidget(self.repeat_btn)
+        mode_row.addWidget(self.lyrics_btn)
         mode_row.addStretch()
         sl.addLayout(mode_row)
 
@@ -1018,7 +978,7 @@ class LibraryTab(QWidget):
 
         self.stack = QStackedWidget()
 
-        # --- page 0: library (filter chips + track list) ---
+        # --- page 0: library ---
         libpage = QWidget()
         lp = QVBoxLayout(libpage)
         lp.setContentsMargins(0, 0, 0, 0)
@@ -1063,7 +1023,7 @@ class LibraryTab(QWidget):
         lp.addWidget(scroll)
         self.stack.addWidget(libpage)
 
-        # --- page 1: categories (create + manage) ---
+        # --- page 1 ---
         catpage = QWidget()
         cp = QVBoxLayout(catpage)
         cp.setContentsMargins(0, 0, 0, 0)
@@ -1106,10 +1066,10 @@ class LibraryTab(QWidget):
         self.tab_cat.setChecked(i == 1)
         self.stack.setCurrentIndex(i)
         if i == 0:
-            self._prune_missing()        # catch files deleted outside the app
+            self._prune_missing()        
             self._refresh_filters()
             self._refresh_list()
-        elif i == 1:
+        else:
             self._prune_missing()
             self._refresh_categories_page()
 
@@ -1253,7 +1213,6 @@ class LibraryTab(QWidget):
     def add_track(self, entry):
         entry.setdefault("categories", [])
         entry.setdefault("favorite", False)
-        # already in the library? keep the existing one, don't add a duplicate
         if any(self._same_track(t, entry) for t in self.store["tracks"]):
             self._refresh_list()
             return
@@ -1261,59 +1220,6 @@ class LibraryTab(QWidget):
         save_store(self.store)
         self._refresh_list()
         self._refresh_categories_page()
-        # kick off BPM/key analysis for the new track
-        self._enqueue_analysis(entry)
-
-    # -- BPM / key analysis (runs one file at a time in the background) --
-    def _enqueue_analysis(self, entry):
-        if not ANALYSIS_AVAILABLE:
-            return
-        if not entry.get("file") or not os.path.exists(entry["file"]):
-            return
-        if entry["file"] in [e.get("file") for e in self._analyze_queue]:
-            return
-        self._analyze_queue.append(entry)
-        self._process_analysis()
-
-    def _process_analysis(self):
-        if self._analyzing or not self._analyze_queue:
-            return
-        entry = self._analyze_queue.pop(0)
-        self._analyzing = True
-        worker = AnalyzeWorker(entry["file"])
-        self._analyze_workers.append(worker)
-        worker.done.connect(self._on_analyzed)
-        worker.finished.connect(lambda w=worker: self._cleanup_analyzer(w))
-        worker.start()
-
-    def _cleanup_analyzer(self, worker):
-        if worker in self._analyze_workers:
-            self._analyze_workers.remove(worker)
-        worker.deleteLater()
-
-    def _on_analyzed(self, path, bpm, key):
-        if bpm:
-            for t in self.store["tracks"]:
-                if t.get("file") == path:
-                    t["bpm"] = bpm
-                    t["key"] = key
-            save_store(self.store)
-            for row in self.rows:
-                if row.entry.get("file") == path:
-                    row.entry["bpm"] = bpm
-                    row.entry["key"] = key
-                    row.update_meta()
-        self._analyzing = False
-        self._process_analysis()
-
-    def analyze_entry(self, entry):
-        """Manual (re)analysis from the right-click menu."""
-        if not ANALYSIS_AVAILABLE:
-            QMessageBox.information(
-                self, "Analysis unavailable",
-                "Install the 'librosa' package to detect BPM and key.")
-            return
-        self._enqueue_analysis(entry)
 
     def add_category(self, name):
         name = name.strip()
@@ -1472,7 +1378,6 @@ class LibraryTab(QWidget):
 
     # -- playback --
     def _play_entry(self, entry):
-        # the current view becomes the play queue
         self.play_order = self._visible_tracks()
         self.play_index = next(
             (i for i, t in enumerate(self.play_order)
@@ -1509,7 +1414,7 @@ class LibraryTab(QWidget):
     def _play_next(self):
         if not self.play_order:
             return
-        if self.repeat == 2:  # repeat one
+        if self.repeat == 2: 
             self._load_and_play(self.play_order[self.play_index])
             return
         if self.shuffle and len(self.play_order) > 1:
@@ -1520,9 +1425,9 @@ class LibraryTab(QWidget):
         else:
             self.play_index += 1
             if self.play_index >= len(self.play_order):
-                if self.repeat == 1:      # repeat all -> wrap
+                if self.repeat == 1:      
                     self.play_index = 0
-                else:                     # off -> stop at the end
+                else:                    
                     self.play_index = len(self.play_order) - 1
                     return
         self._load_and_play(self.play_order[self.play_index])
@@ -1530,7 +1435,6 @@ class LibraryTab(QWidget):
     def _play_prev(self):
         if not self.play_order:
             return
-        # if we're a few seconds in, restart the song instead
         if self.player.position() > 3000:
             self.player.setPosition(0)
             return
@@ -1577,9 +1481,7 @@ class LibraryTab(QWidget):
         self._seeking = False
 
 
-# ---------------------------------------------------------------------------
-# Animated Milky Way background - drifting, gently twinkling stars
-# ---------------------------------------------------------------------------
+# Animated Milky Way background
 class Starfield(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1598,7 +1500,7 @@ class Starfield(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         if not self.reduced:
-            self.timer.start(33)  # ~30 fps - smooth but light
+            self.timer.start(33)  # ~30 fps
 
     def set_reduced(self, reduced):
         self.reduced = reduced
@@ -1636,7 +1538,7 @@ class Starfield(QWidget):
     def _spawn_shooting(self):
         w = max(self.width(), 1)
         h = max(self.height(), 1)
-        side = random.randint(0, 3)          # enter from a random edge
+        side = random.randint(0, 3)          
         m = 40
         if side == 0:      # top
             sx, sy = random.uniform(0, w), -m
@@ -1778,13 +1680,7 @@ class Starfield(QWidget):
         p.end()
 
 
-# ---------------------------------------------------------------------------
-# Main window - IS the starfield (paints the background); tabs are children so
-# their transparent areas let the animated stars show through.
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # Settings tab
-# ---------------------------------------------------------------------------
 class SettingsTab(QWidget):
     def __init__(self, app):
         super().__init__()
@@ -1908,7 +1804,6 @@ class Beatpull(Starfield):
         layout.addWidget(self.tabs)
         self.setStyleSheet(STYLE)
 
-        # Ctrl+F -> jump to the library search box
         self._sc_find = QShortcut(QKeySequence("Ctrl+F"), self)
         self._sc_find.activated.connect(self._focus_search)
 
@@ -1918,8 +1813,6 @@ class Beatpull(Starfield):
         self.library_tab.search.setFocus()
 
     def keyPressEvent(self, e):
-        # These only fire when a text field isn't focused (fields consume them),
-        # so typing spaces in search/URL still works.
         k = e.key()
         if k == Qt.Key_Space:
             self.library_tab.toggle_play()
@@ -1966,9 +1859,7 @@ class Beatpull(Starfield):
         e.acceptProposedAction()
 
 
-# ---------------------------------------------------------------------------
-# Look & feel - tweak freely
-# ---------------------------------------------------------------------------
+# Look & feel
 STYLE = """
 QWidget {
     background: transparent;
@@ -2151,12 +2042,11 @@ QSlider::handle:horizontal {
     background: #ffffff; width: 14px; height: 14px;
     margin: -5px 0; border-radius: 7px;
 }
-/* Scrollbars hidden (0px) but wheel/trackpad scrolling still works */
-QScrollBar:vertical { width: 0px; background: transparent; }
-QScrollBar:horizontal { height: 0px; background: transparent; }
-QScrollBar::handle { background: transparent; }
-QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
-QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+QScrollBar:vertical { background: transparent; width: 8px; }
+QScrollBar::handle:vertical {
+    background: rgba(120,110,220,0.3); border-radius: 4px;
+}
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 """
 
 
@@ -2175,7 +2065,6 @@ def main():
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
 
-    # On Windows, this makes the taskbar use our icon instead of python's.
     if sys.platform.startswith("win"):
         try:
             import ctypes

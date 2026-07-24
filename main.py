@@ -56,7 +56,7 @@ ANALYSIS_AVAILABLE = importlib.util.find_spec("librosa") is not None
 # Version shown in the app. The launcher writes the live version to
 # ~/.beatpull/app/version.txt when it updates, so this reflects the real
 # running version. Falls back to this constant when run from source.
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 
 def app_version():
@@ -200,9 +200,10 @@ class DownloadWorker(QThread):
             {"key": "FFmpegMetadata", "add_metadata": True})
         return opts
 
-    def _finalize(self, info):
+    def _finalize(self, info, playlist=None):
         """Turn one downloaded video's info into a library entry, moving its
-        thumbnail into the private thumbs folder and clearing stray images."""
+        thumbnail into the private thumbs folder and clearing stray images.
+        If it came from a playlist, tag it with the playlist name."""
         media_path = None
         reqs = info.get("requested_downloads")
         if reqs and reqs[0].get("filepath"):
@@ -245,6 +246,7 @@ class DownloadWorker(QThread):
             "thumb": thumb_path,
             "format": self.fmt,
             "duration": info.get("duration", 0),
+            "playlist": playlist,
         }
 
     def run(self):
@@ -259,12 +261,17 @@ class DownloadWorker(QThread):
                     self.failed.emit(f"{url}: nothing downloaded")
                     continue
                 entries = info.get("entries")
-                items = list(entries) if entries is not None else [info]
+                if entries is not None:
+                    playlist_name = info.get("title") or None
+                    items = list(entries)
+                else:
+                    playlist_name = None
+                    items = [info]
                 for it in items:
                     if not it:
                         continue
                     try:
-                        entry = self._finalize(it)
+                        entry = self._finalize(it, playlist_name)
                         self.finished_ok.emit(entry)
                         added += 1
                     except Exception as e:  # noqa: BLE001
@@ -1235,11 +1242,33 @@ class LibraryTab(QWidget):
     def add_track(self, entry):
         entry.setdefault("categories", [])
         entry.setdefault("favorite", False)
-        if any(self._same_track(t, entry) for t in self.store["tracks"]):
+        # Playlist downloads are auto-filed into a category named after the
+        # playlist (created if it doesn't exist yet).
+        pl = entry.pop("playlist", None)
+        new_cat = False
+        if pl and pl not in self.store["categories"]:
+            self.store["categories"].append(pl)
+            new_cat = True
+
+        existing = next(
+            (t for t in self.store["tracks"] if self._same_track(t, entry)), None)
+        if existing:
+            # already have it - just make sure it's tagged with the playlist
+            if pl and pl not in (existing.get("categories") or []):
+                existing.setdefault("categories", []).append(pl)
+                save_store(self.store)
+            if new_cat:
+                self._refresh_filters()
             self._refresh_list()
+            self._refresh_categories_page()
             return
+
+        if pl and pl not in entry["categories"]:
+            entry["categories"].append(pl)
         self.store["tracks"].append(entry)
         save_store(self.store)
+        if new_cat:
+            self._refresh_filters()
         self._refresh_list()
         self._refresh_categories_page()
         self._enqueue_analysis(entry)

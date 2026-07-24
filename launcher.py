@@ -43,7 +43,7 @@ VERSION_URL = "https://raw.githubusercontent.com/Stemzy/BeatPull/refs/heads/main
 # The version baked into THIS exe. Bump it every time you build a new exe so
 # the app doesn't re-download an older hosted main.py than the one it shipped
 # with. Keep it in sync with the version.json you publish.
-BUNDLED_VERSION = "1.0.3"
+BUNDLED_VERSION = "1.0.4"
 
 # ---------------------------------------------------------------------------
 # Paths

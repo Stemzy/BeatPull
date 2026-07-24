@@ -48,10 +48,15 @@ LIBRARY_JSON = os.path.join(DATA_DIR, "library.json")
 THUMBS_DIR = os.path.join(DATA_DIR, "thumbs")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# BPM/key analysis needs librosa. Only check if it's importable here (fast);
+# the heavy import happens inside the worker thread when we actually analyze.
+import importlib.util
+ANALYSIS_AVAILABLE = importlib.util.find_spec("librosa") is not None
+
 # Version shown in the app. The launcher writes the live version to
 # ~/.beatpull/app/version.txt when it updates, so this reflects the real
 # running version. Falls back to this constant when run from source.
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 
 def app_version():
@@ -301,6 +306,42 @@ class PreviewWorker(QThread):
             })
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
+
+
+# Analysis worker: estimates BPM (tempo) and musical key for an audio file
+class AnalyzeWorker(QThread):
+    done = Signal(str, float, str)   # file path, bpm, key ("" if it failed)
+
+    KEYS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    MAJ = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+    MIN = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+
+    def run(self):
+        try:
+            import librosa
+            import numpy as np
+            y, sr = librosa.load(self.path, mono=True, duration=90)
+            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+            bpm = float(round(float(np.atleast_1d(tempo)[0])))
+
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr).mean(axis=1)
+            maj = np.array(self.MAJ)
+            minor = np.array(self.MIN)
+            best_corr, best = -2.0, ""
+            for i in range(12):
+                cm = np.corrcoef(chroma, np.roll(maj, i))[0, 1]
+                ci = np.corrcoef(chroma, np.roll(minor, i))[0, 1]
+                if cm > best_corr:
+                    best_corr, best = cm, f"{self.KEYS[i]} major"
+                if ci > best_corr:
+                    best_corr, best = ci, f"{self.KEYS[i]} minor"
+            self.done.emit(self.path, bpm, best)
+        except Exception:
+            self.done.emit(self.path, 0.0, "")
 
 
 # Download tab
@@ -610,14 +651,10 @@ class TrackRow(QFrame):
         info.setSpacing(2)
         t = QLabel(entry["title"])
         t.setObjectName("rowTitle")
-        cats = entry.get("categories") or []
-        sub = f"{entry['artist']}  ·  {entry['format'].upper()}"
-        if cats:
-            sub += "  ·  " + ", ".join(cats)
-        a = QLabel(sub)
-        a.setObjectName("rowArtist")
+        self.sub_label = QLabel(self._subtitle(entry))
+        self.sub_label.setObjectName("rowArtist")
         info.addWidget(t)
-        info.addWidget(a)
+        info.addWidget(self.sub_label)
         lay.addLayout(info)
         lay.addStretch()
 
@@ -640,6 +677,21 @@ class TrackRow(QFrame):
         delete.setFixedWidth(40)
         delete.clicked.connect(lambda: owner.delete_track(entry))
         lay.addWidget(delete)
+
+    @staticmethod
+    def _subtitle(entry):
+        parts = [entry.get("artist", ""), entry.get("format", "").upper()]
+        if entry.get("bpm"):
+            parts.append(f"{int(entry['bpm'])} BPM")
+        if entry.get("key"):
+            parts.append(entry["key"])
+        cats = entry.get("categories") or []
+        if cats:
+            parts.append(", ".join(cats))
+        return "  ·  ".join(p for p in parts if p)
+
+    def update_meta(self):
+        self.sub_label.setText(self._subtitle(self.entry))
 
     def set_playing(self, playing):
         self.setProperty("playing", "true" if playing else "false")
@@ -679,6 +731,10 @@ class TrackRow(QFrame):
         ren = QAction("Rename…", self)
         ren.triggered.connect(lambda: self.owner.rename_track(self.entry))
         menu.addAction(ren)
+
+        analyze = QAction("Analyze BPM & key", self)
+        analyze.triggered.connect(lambda: self.owner.analyze_entry(self.entry))
+        menu.addAction(analyze)
 
         menu.addSeparator()
         dele = QAction("Remove from library", self)
@@ -751,8 +807,11 @@ class LibraryTab(QWidget):
         self.play_order = []             
         self.play_index = -1
         self.shuffle = False
-        self.repeat = 0                 
+        self.repeat = 0
         self._accent = QColor("#453aa8")
+        self._analyze_workers = []       # keep refs so threads aren't GC'd
+        self._analyze_queue = []         # entries waiting for BPM/key analysis
+        self._analyzing = False
         self.player = QMediaPlayer()
         self.audio = QAudioOutput()
         self.player.setAudioOutput(self.audio)
@@ -767,6 +826,11 @@ class LibraryTab(QWidget):
         self._refresh_list()
         self._refresh_categories_page()
         self._resume_last()
+        # analyze any tracks missing BPM/key (one at a time, in the background)
+        if ANALYSIS_AVAILABLE:
+            for t in self.store["tracks"]:
+                if not t.get("bpm"):
+                    self._enqueue_analysis(t)
 
     def _resume_last(self):
         last = SETTINGS.get("last_file")
@@ -1178,6 +1242,57 @@ class LibraryTab(QWidget):
         save_store(self.store)
         self._refresh_list()
         self._refresh_categories_page()
+        self._enqueue_analysis(entry)
+
+    # -- BPM / key analysis (one file at a time, in the background) --
+    def _enqueue_analysis(self, entry):
+        if not ANALYSIS_AVAILABLE:
+            return
+        if not entry.get("file") or not os.path.exists(entry["file"]):
+            return
+        if entry["file"] in [e.get("file") for e in self._analyze_queue]:
+            return
+        self._analyze_queue.append(entry)
+        self._process_analysis()
+
+    def _process_analysis(self):
+        if self._analyzing or not self._analyze_queue:
+            return
+        entry = self._analyze_queue.pop(0)
+        self._analyzing = True
+        worker = AnalyzeWorker(entry["file"])
+        self._analyze_workers.append(worker)
+        worker.done.connect(self._on_analyzed)
+        worker.finished.connect(lambda w=worker: self._cleanup_analyzer(w))
+        worker.start()
+
+    def _cleanup_analyzer(self, worker):
+        if worker in self._analyze_workers:
+            self._analyze_workers.remove(worker)
+        worker.deleteLater()
+
+    def _on_analyzed(self, path, bpm, key):
+        if bpm:
+            for t in self.store["tracks"]:
+                if t.get("file") == path:
+                    t["bpm"] = bpm
+                    t["key"] = key
+            save_store(self.store)
+            for row in self.rows:
+                if row.entry.get("file") == path:
+                    row.entry["bpm"] = bpm
+                    row.entry["key"] = key
+                    row.update_meta()
+        self._analyzing = False
+        self._process_analysis()
+
+    def analyze_entry(self, entry):
+        if not ANALYSIS_AVAILABLE:
+            QMessageBox.information(
+                self, "Analysis unavailable",
+                "Install the 'librosa' package to detect BPM and key.")
+            return
+        self._enqueue_analysis(entry)
 
     def add_category(self, name):
         name = name.strip()

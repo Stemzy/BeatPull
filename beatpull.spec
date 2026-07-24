@@ -103,7 +103,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="Beatpull",
-    console=True,               # no black console window
+    console=False,               # no black console window
     icon="icon.ico" if os.path.exists("icon.ico") else None,
 )
 

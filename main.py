@@ -2154,12 +2154,15 @@ QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 
 def _load_app_icon():
     """Use a custom icon if the user drops one next to main.py.
-    Looked-for names (first match wins): icon.ico, icon.png, icon.jpg."""
+    Looked-for names (first match wins): icon.ico, icon.png, icon.jpg.
+    Loads via QPixmap so a failed decode is detected (returns an empty icon)."""
     here = os.path.dirname(os.path.abspath(__file__))
     for name in ("icon.ico", "icon.png", "icon.jpg", "icon.jpeg"):
         path = os.path.join(here, name)
         if os.path.exists(path):
-            return QIcon(path)
+            pix = QPixmap(path)
+            if not pix.isNull():
+                return QIcon(pix)
     return QIcon()
 
 

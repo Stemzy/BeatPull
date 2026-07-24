@@ -53,21 +53,14 @@ os.makedirs(DATA_DIR, exist_ok=True)
 import importlib.util
 ANALYSIS_AVAILABLE = importlib.util.find_spec("librosa") is not None
 
-# Version shown in the app. The launcher writes the live version to
-# ~/.beatpull/app/version.txt when it updates, so this reflects the real
-# running version. Falls back to this constant when run from source.
+# Version shown in the app. Because the auto-updater replaces this whole file
+# when it pulls an update, this constant is always the true running version —
+# whether launched from the exe or run directly with `python main.py`.
+# Bump it together with version.json on every release.
 APP_VERSION = "1.0.4"
 
 
 def app_version():
-    try:
-        with open(os.path.join(DATA_DIR, "app", "version.txt"),
-                  "r", encoding="utf-8") as f:
-            v = f.read().strip()
-            if v:
-                return v
-    except Exception:
-        pass
     return APP_VERSION
 
 

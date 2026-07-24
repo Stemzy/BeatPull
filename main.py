@@ -48,6 +48,23 @@ LIBRARY_JSON = os.path.join(DATA_DIR, "library.json")
 THUMBS_DIR = os.path.join(DATA_DIR, "thumbs")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Version shown in the app. The launcher writes the live version to
+# ~/.beatpull/app/version.txt when it updates, so this reflects the real
+# running version. Falls back to this constant when run from source.
+APP_VERSION = "1.0.2"
+
+
+def app_version():
+    try:
+        with open(os.path.join(DATA_DIR, "app", "version.txt"),
+                  "r", encoding="utf-8") as f:
+            v = f.read().strip()
+            if v:
+                return v
+    except Exception:
+        pass
+    return APP_VERSION
+
 
 def load_store():
     """Return {"categories": [...], "tracks": [...]}. Handles the old
@@ -1740,6 +1757,12 @@ class Beatpull(Starfield):
         self.tabs.addTab(self.library_tab, "Library")
         self.tabs.addTab(self.settings_tab, "Settings")
 
+        # version label in the top-right of the tab bar (auto-reflects updates)
+        self.ver_label = QLabel(f"v{app_version()}")
+        self.ver_label.setObjectName("verLabel")
+        self.ver_label.setContentsMargins(0, 0, 16, 0)
+        self.tabs.setCornerWidget(self.ver_label, Qt.TopRightCorner)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.tabs)
@@ -1821,6 +1844,7 @@ QTabBar::tab:selected {
     color: #ffffff;
     border-bottom: 3px solid #6f7ce8;
 }
+#verLabel { color: #8296bf; font-size: 12px; font-weight: 600; }
 #title { font-size: 28px; font-weight: 800; color: #ffffff; }
 #subtitle { font-size: 13px; color: #8296bf; }
 #card {

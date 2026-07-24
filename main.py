@@ -286,56 +286,6 @@ class PreviewWorker(QThread):
             self.failed.emit(str(e))
 
 
-# Lyrics worker
-class LyricsWorker(QThread):
-    done = Signal(str)
-
-    def __init__(self, artist, title):
-        super().__init__()
-        self.artist = artist or ""
-        self.title = title or ""
-
-    @staticmethod
-    def _clean(s):
-        import re
-        s = re.sub(r"\[[^\]]*\]", "", s)               # [Official Video]
-        s = re.sub(r"\((?:[^)]*?(?:official|lyric|audio|video|hd|4k|"
-                   r"visualizer|mv|m/v)[^)]*)\)", "", s, flags=re.I)
-        s = re.sub(r"(?i)\b(official (music )?video|official audio|"
-                   r"lyrics?|music video|audio)\b", "", s)
-        s = re.sub(r"\s{2,}", " ", s)
-        return s.strip(" -–—|")
-
-    @staticmethod
-    def _fetch(artist, title):
-        import urllib.request
-        import urllib.parse
-        url = ("https://api.lyrics.ovh/v1/"
-               f"{urllib.parse.quote(artist)}/{urllib.parse.quote(title)}")
-        with urllib.request.urlopen(url, timeout=12) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
-        return (data.get("lyrics") or "").strip()
-
-    def run(self):
-        title = self._clean(self.title)
-        artist = self._clean(self.artist)
-        attempts = [(artist, title)]
-        if " - " in title:
-            a, t = title.split(" - ", 1)
-            attempts.append((self._clean(a), self._clean(t)))
-        for a, t in attempts:
-            if not a or not t:
-                continue
-            try:
-                lyr = self._fetch(a, t)
-                if lyr:
-                    self.done.emit(lyr)
-                    return
-            except Exception:
-                continue
-        self.done.emit("")
-
-
 # Download tab
 class DownloadTab(QWidget):
     track_added = Signal(dict)
@@ -786,9 +736,6 @@ class LibraryTab(QWidget):
         self.shuffle = False
         self.repeat = 0                 
         self._accent = QColor("#453aa8")
-        self.lworker = None
-        self.current_lyrics = ""
-        self._lyrics_seq = 0
         self.player = QMediaPlayer()
         self.audio = QAudioOutput()
         self.player.setAudioOutput(self.audio)
@@ -929,14 +876,8 @@ class LibraryTab(QWidget):
         self.repeat_btn.setObjectName("chip")
         self.repeat_btn.setCheckable(True)
         self.repeat_btn.clicked.connect(self._cycle_repeat)
-        self.lyrics_btn = QPushButton("Lyrics")
-        self.lyrics_btn.setObjectName("chip")
-        self.lyrics_btn.setEnabled(False)
-        self.lyrics_btn.setToolTip("Show lyrics for the current song")
-        self.lyrics_btn.clicked.connect(self._show_lyrics)
         mode_row.addWidget(self.shuffle_btn)
         mode_row.addWidget(self.repeat_btn)
-        mode_row.addWidget(self.lyrics_btn)
         mode_row.addStretch()
         sl.addLayout(mode_row)
 

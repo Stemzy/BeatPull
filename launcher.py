@@ -28,7 +28,9 @@ import urllib.request
 # (main.py is loaded dynamically, so the bundler can't see its imports). This
 # keeps the build from pulling in all of Qt (WebEngine, QML, Charts, etc.).
 try:
-    from PySide6 import QtCore, QtGui, QtWidgets, QtMultimedia  # noqa: F401
+    from PySide6 import (  # noqa: F401
+        QtCore, QtGui, QtWidgets, QtMultimedia, QtMultimediaWidgets,
+    )
 except Exception:
     pass
 
@@ -43,7 +45,7 @@ VERSION_URL = "https://raw.githubusercontent.com/Stemzy/BeatPull/refs/heads/main
 # The version baked into THIS exe. Bump it every time you build a new exe so
 # the app doesn't re-download an older hosted main.py than the one it shipped
 # with. Keep it in sync with the version.json you publish.
-BUNDLED_VERSION = "1.0.4"
+BUNDLED_VERSION = "1.0.5"
 
 # ---------------------------------------------------------------------------
 # Paths

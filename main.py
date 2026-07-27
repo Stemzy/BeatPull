@@ -14,6 +14,7 @@ from PySide6.QtGui import (
     QPen, QBrush, QAction, QImage, QKeySequence, QShortcut, QDesktopServices,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -31,6 +32,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QGridLayout,
+    QStackedLayout,
     QStackedWidget,
     QStyle,
     QTabWidget,
@@ -57,7 +60,7 @@ ANALYSIS_AVAILABLE = importlib.util.find_spec("librosa") is not None
 # when it pulls an update, this constant is always the true running version —
 # whether launched from the exe or run directly with `python main.py`.
 # Bump it together with version.json on every release.
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 
 
 def app_version():
@@ -792,6 +795,65 @@ class Sidebar(QFrame):
         return self.scrim
 
 
+# Now-playing video surface. Uses a stacked layout so a small round button
+# reliably draws ON TOP of the video (a plain child of QVideoWidget gets hidden
+# by the video surface). The whole panel goes fullscreen, so the button rides
+# along and toggles back (same ⛶ symbol both ways). Esc also exits.
+class VideoPanel(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._home = None   # (layout, index) to return to after fullscreen
+
+        stack = QStackedLayout(self)
+        stack.setStackingMode(QStackedLayout.StackAll)
+        stack.setContentsMargins(0, 0, 0, 0)
+
+        self.video = QVideoWidget()
+        stack.addWidget(self.video)
+
+        # transparent overlay that only "catches" clicks on the button itself
+        overlay = QWidget()
+        overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        og = QGridLayout(overlay)
+        og.setContentsMargins(10, 10, 10, 10)
+        self.fs_btn = QPushButton("⛶")
+        self.fs_btn.setObjectName("fsBtn")
+        self.fs_btn.setFixedSize(32, 32)
+        self.fs_btn.setCursor(Qt.PointingHandCursor)
+        self.fs_btn.setToolTip("Fullscreen (Esc to exit)")
+        self.fs_btn.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.fs_btn.clicked.connect(self.toggle_fullscreen)
+        og.addWidget(self.fs_btn, 0, 0, Qt.AlignBottom | Qt.AlignRight)
+        stack.addWidget(overlay)
+        stack.setCurrentWidget(overlay)
+
+    def set_home(self, layout, index):
+        self._home = (layout, index)
+
+    def toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+            if self._home:
+                layout, index = self._home
+                layout.insertWidget(index, self)
+            self.setFixedSize(250, 250)
+            self.show()
+        else:
+            self.setParent(None)   # detach from the sidebar layout
+            self.setMinimumSize(0, 0)
+            self.setMaximumSize(16777215, 16777215)
+            self.showFullScreen()
+            self.setFocus()
+            self.fs_btn.raise_()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape and self.isFullScreen():
+            self.toggle_fullscreen()
+        else:
+            super().keyPressEvent(event)
+
+
 # Library tab: now-playing sidebar + track list
 class LibraryTab(QWidget):
     def __init__(self):
@@ -844,6 +906,7 @@ class LibraryTab(QWidget):
         self.now_artist.setText(entry["artist"])
         self._set_art(entry.get("thumb"))
         self._apply_theme(self._dominant_color(entry.get("thumb")), entry.get("thumb"))
+        self._show_media(entry)
         self.now_file = last
         self.play_order = self._visible_tracks()
         self.play_index = next(
@@ -902,6 +965,15 @@ class LibraryTab(QWidget):
         self.art.setAlignment(Qt.AlignCenter)
         self._set_art(None)
         sl.addWidget(self.art)
+
+        # video surface (shown instead of the art when playing a video file);
+        # the fullscreen button overlaps its bottom-right corner.
+        self.video = VideoPanel()
+        self.video.setFixedSize(250, 250)
+        self.video.hide()
+        self.player.setVideoOutput(self.video.video)
+        sl.addWidget(self.video)
+        self.video.set_home(sl, sl.indexOf(self.video))
 
         self.now_title = QLabel("No song loaded")
         self.now_title.setObjectName("nowTitle")
@@ -1482,6 +1554,20 @@ class LibraryTab(QWidget):
             self.play_index = 0
         self._load_and_play(entry)
 
+    def _is_video(self, path):
+        return os.path.splitext(path or "")[1].lower() in (
+            ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v")
+
+    def _show_media(self, entry):
+        """Show the video surface for video files, the album art otherwise."""
+        if self._is_video(entry.get("file")):
+            self.art.hide()
+            self.video.show()
+            self.video.fs_btn.raise_()
+        else:
+            self.video.hide()
+            self.art.show()
+
     def _load_and_play(self, entry):
         if not os.path.exists(entry["file"]):
             self.now_title.setText("File missing")
@@ -1492,6 +1578,7 @@ class LibraryTab(QWidget):
         self.now_artist.setText(entry["artist"])
         self._set_art(entry.get("thumb"))
         self._apply_theme(self._dominant_color(entry.get("thumb")), entry.get("thumb"))
+        self._show_media(entry)
         self.now_file = entry.get("file")
         self._highlight_now()
         SETTINGS["last_file"] = self.now_file
@@ -1880,7 +1967,7 @@ class SettingsTab(QWidget):
 class Beatpull(Starfield):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Neegy")
+        self.setWindowTitle("BeatPull")
         self.setMinimumSize(760, 560)
         self.resize(int(SETTINGS.get("win_w", 980)), int(SETTINGS.get("win_h", 700)))
         self.setAcceptDrops(True)
@@ -2101,6 +2188,11 @@ QProgressBar::chunk {
     font-size: 18px; padding: 2px;
 }
 #starBtn:hover { color: #ffe17a; }
+#fsBtn {
+    background: rgba(0,0,0,0.55); color: #ffffff; border: none;
+    border-radius: 15px; font-size: 15px;
+}
+#fsBtn:hover { background: rgba(0,0,0,0.8); }
 #chk { color: #b8c0e0; font-size: 13px; spacing: 8px; }
 #chk::indicator {
     width: 16px; height: 16px; border-radius: 4px;

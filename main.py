@@ -842,15 +842,18 @@ class VideoPanel(QWidget):
         self.fs_btn.hide()
 
     def _reposition(self):
-        # Work out whether the button should be visible right now, and where.
+        # Only float the button while Beatpull is the active app, so it doesn't
+        # hover over other windows when you tab away.
+        app_active = QApplication.applicationState() == Qt.ApplicationActive
         if self.isFullScreen():
-            geo = self.screen().geometry()
-            x = geo.x() + geo.width() - self.fs_btn.width() - 24
-            y = geo.y() + geo.height() - self.fs_btn.height() - 24
-            visible = True
+            visible = app_active
+            if visible:
+                geo = self.screen().geometry()
+                x = geo.x() + geo.width() - self.fs_btn.width() - 24
+                y = geo.y() + geo.height() - self.fs_btn.height() - 24
         else:
             win = self.window()
-            visible = (self.isVisible() and self.video.isVisible()
+            visible = (app_active and self.isVisible() and self.video.isVisible()
                        and not (win is not None and win.isMinimized()))
             if visible:
                 br = self.video.mapToGlobal(

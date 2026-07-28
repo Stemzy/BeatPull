@@ -9,7 +9,7 @@ import sys
 
 from yt_dlp import YoutubeDL
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QUrl, QSize, QTimer, QVariantAnimation, QPoint,
+    Qt, QThread, Signal, QUrl, QSize, QTimer, QVariantAnimation, QPoint, QEvent,
 )
 from PySide6.QtGui import (
     QFont, QPixmap, QIcon, QColor, QPainter, QLinearGradient, QRadialGradient,
@@ -828,14 +828,28 @@ class VideoPanel(QWidget):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._reposition)
+        self._filtered_window = None
 
     def set_home(self, layout, index):
         self._home = (layout, index)
 
     def show_button(self):
+        # follow the top-level window's move/resize events for lag-free tracking
+        win = self.window()
+        if win is not self._filtered_window:
+            if self._filtered_window is not None:
+                self._filtered_window.removeEventFilter(self)
+            if win is not None:
+                win.installEventFilter(self)
+            self._filtered_window = win
         if not self._timer.isActive():
-            self._timer.start(120)
+            self._timer.start(200)   # slow fallback; moves are event-driven
         self._reposition()
+
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.Move, QEvent.Resize, QEvent.WindowStateChange):
+            self._reposition()
+        return False
 
     def hide_button(self):
         self._timer.stop()

@@ -8,7 +8,9 @@ import shutil
 import sys
 
 from yt_dlp import YoutubeDL
-from PySide6.QtCore import Qt, QThread, Signal, QUrl, QSize, QTimer, QVariantAnimation
+from PySide6.QtCore import (
+    Qt, QThread, Signal, QUrl, QSize, QTimer, QVariantAnimation, QPoint,
+)
 from PySide6.QtGui import (
     QFont, QPixmap, QIcon, QColor, QPainter, QLinearGradient, QRadialGradient,
     QPen, QBrush, QAction, QImage, QKeySequence, QShortcut, QDesktopServices,
@@ -805,31 +807,64 @@ class VideoPanel(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
         self._home = None   # (layout, index) to return to after fullscreen
 
-        stack = QStackedLayout(self)
-        stack.setStackingMode(QStackedLayout.StackAll)
-        stack.setContentsMargins(0, 0, 0, 0)
-
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
         self.video = QVideoWidget()
-        stack.addWidget(self.video)
+        lay.addWidget(self.video)
 
-        # transparent overlay that only "catches" clicks on the button itself
-        overlay = QWidget()
-        overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        og = QGridLayout(overlay)
-        og.setContentsMargins(10, 10, 10, 10)
-        self.fs_btn = QPushButton("⛶")
+        # The button is its own always-on-top tool window, so it floats above
+        # the native video surface no matter what. A timer keeps it pinned to
+        # the video's bottom-right corner (and the screen corner in fullscreen).
+        self.fs_btn = QPushButton("⛶", self)   # ⛶
         self.fs_btn.setObjectName("fsBtn")
-        self.fs_btn.setFixedSize(32, 32)
+        self.fs_btn.setFixedSize(34, 34)
         self.fs_btn.setCursor(Qt.PointingHandCursor)
         self.fs_btn.setToolTip("Fullscreen (Esc to exit)")
-        self.fs_btn.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.fs_btn.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.fs_btn.setAttribute(Qt.WA_TranslucentBackground, True)
         self.fs_btn.clicked.connect(self.toggle_fullscreen)
-        og.addWidget(self.fs_btn, 0, 0, Qt.AlignBottom | Qt.AlignRight)
-        stack.addWidget(overlay)
-        stack.setCurrentWidget(overlay)
+        self.fs_btn.hide()
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._reposition)
 
     def set_home(self, layout, index):
         self._home = (layout, index)
+
+    def show_button(self):
+        if not self._timer.isActive():
+            self._timer.start(120)
+        self._reposition()
+
+    def hide_button(self):
+        self._timer.stop()
+        self.fs_btn.hide()
+
+    def _reposition(self):
+        # Work out whether the button should be visible right now, and where.
+        if self.isFullScreen():
+            geo = self.screen().geometry()
+            x = geo.x() + geo.width() - self.fs_btn.width() - 24
+            y = geo.y() + geo.height() - self.fs_btn.height() - 24
+            visible = True
+        else:
+            win = self.window()
+            visible = (self.isVisible() and self.video.isVisible()
+                       and not (win is not None and win.isMinimized()))
+            if visible:
+                br = self.video.mapToGlobal(
+                    QPoint(self.video.width(), self.video.height()))
+                x = br.x() - self.fs_btn.width() - 10
+                y = br.y() - self.fs_btn.height() - 10
+        if not visible:
+            if self.fs_btn.isVisible():
+                self.fs_btn.hide()
+            return
+        if not self.fs_btn.isVisible():
+            self.fs_btn.show()
+            self.fs_btn.raise_()
+        self.fs_btn.move(x, y)
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
@@ -845,7 +880,15 @@ class VideoPanel(QWidget):
             self.setMaximumSize(16777215, 16777215)
             self.showFullScreen()
             self.setFocus()
-            self.fs_btn.raise_()
+        self.show_button()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.show_button()
+
+    def hideEvent(self, event):
+        self.hide_button()
+        super().hideEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape and self.isFullScreen():
@@ -1563,7 +1606,6 @@ class LibraryTab(QWidget):
         if self._is_video(entry.get("file")):
             self.art.hide()
             self.video.show()
-            self.video.fs_btn.raise_()
         else:
             self.video.hide()
             self.art.show()
@@ -2189,10 +2231,10 @@ QProgressBar::chunk {
 }
 #starBtn:hover { color: #ffe17a; }
 #fsBtn {
-    background: rgba(0,0,0,0.55); color: #ffffff; border: none;
-    border-radius: 15px; font-size: 15px;
+    background: rgba(0,0,0,0.62); color: #ffffff; border: none;
+    border-radius: 17px; font-size: 16px;
 }
-#fsBtn:hover { background: rgba(0,0,0,0.8); }
+#fsBtn:hover { background: rgba(0,0,0,0.85); }
 #chk { color: #b8c0e0; font-size: 13px; spacing: 8px; }
 #chk::indicator {
     width: 16px; height: 16px; border-radius: 4px;

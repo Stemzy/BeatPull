@@ -235,6 +235,23 @@ class DownloadWorker(QThread):
                 except Exception:
                     pass
 
+        # Catch-all sweep: videos sometimes leave thumbnails with extra bits in
+        # the name (e.g. "Title.temp.jpg"). Delete any leftover image whose
+        # name starts with this song's stem - keeps the folder media-only.
+        try:
+            base = os.path.basename(stem)
+            for f in os.listdir(self.out_dir):
+                if not f.startswith(base):
+                    continue
+                if os.path.splitext(f)[1].lower() in (
+                        ".jpg", ".jpeg", ".png", ".webp", ".gif"):
+                    try:
+                        os.remove(os.path.join(self.out_dir, f))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         return {
             "id": info.get("id"),
             "url": info.get("webpage_url"),
@@ -2054,26 +2071,34 @@ class Beatpull(Starfield):
         self._sc_find = QShortcut(QKeySequence("Ctrl+F"), self)
         self._sc_find.activated.connect(self._focus_search)
 
+        # App-wide media hotkeys: Space = play/pause, Left/Right = skip 5s.
+        # An application event filter catches keys no matter which widget has
+        # focus (buttons, the track list, etc.) - typing fields are excluded.
+        QApplication.instance().installEventFilter(self)
+
     def _focus_search(self):
         self.tabs.setCurrentWidget(self.library_tab)
         self.library_tab._show_page(0)
         self.library_tab.search.setFocus()
 
-    def keyPressEvent(self, e):
-        k = e.key()
-        if k == Qt.Key_Space:
-            self.library_tab.toggle_play()
-            e.accept()
-            return
-        if k == Qt.Key_Right:
-            self.library_tab.seek_by(5000)
-            e.accept()
-            return
-        if k == Qt.Key_Left:
-            self.library_tab.seek_by(-5000)
-            e.accept()
-            return
-        super().keyPressEvent(e)
+    #neegy123
+    def eventFilter(self, obj, e):
+        if e.type() == QEvent.KeyPress:
+            fw = QApplication.focusWidget()
+            # don't steal keys while typing or navigating menus/dropdowns
+            if isinstance(fw, (QLineEdit, QTextEdit, QComboBox, QMenu)):
+                return False
+            k = e.key()
+            if k == Qt.Key_Space:
+                self.library_tab.toggle_play()
+                return True
+            if k == Qt.Key_Right:
+                self.library_tab.seek_by(5000)
+                return True
+            if k == Qt.Key_Left:
+                self.library_tab.seek_by(-5000)
+                return True
+        return False
 
     def closeEvent(self, e):
         SETTINGS["win_w"] = self.width()

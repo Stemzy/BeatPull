@@ -62,7 +62,7 @@ ANALYSIS_AVAILABLE = importlib.util.find_spec("librosa") is not None
 # when it pulls an update, this constant is always the true running version —
 # whether launched from the exe or run directly with `python main.py`.
 # Bump it together with version.json on every release.
-APP_VERSION = "1.0.11"
+APP_VERSION = "1.0.12"
 
 
 def app_version():
@@ -227,6 +227,9 @@ class DownloadWorker(QThread):
             want = os.path.splitext(media_path)[0] + "." + self.fmt
             if os.path.exists(want):
                 media_path = want
+
+        print(f"[download] final file: {media_path} "
+              f"(exists: {os.path.exists(media_path)})", file=sys.stderr)
 
         stem = os.path.splitext(media_path)[0]
         thumb_path = ""
@@ -406,9 +409,15 @@ class AnalyzeWorker(QThread):
 
     def run(self):
         try:
+            import time
             import librosa
             import numpy as np
+            t0 = time.time()
             y, sr = self._load_audio(librosa)
+            # 60s from the body of the song is enough for tempo + key and
+            # keeps analysis fast
+            if len(y) > sr * 60:
+                y = y[: sr * 60]
 
             # --- BPM: median onset strength is robust to noise, and fold
             # half/double-time results into the sensible 70-180 range ---
@@ -422,9 +431,13 @@ class AnalyzeWorker(QThread):
             bpm = float(round(bpm))
 
             # --- Key: analyze only the harmonic (melodic) part so drums don't
-            # smear the note profile; median over time beats mean for noise ---
-            y_harm = librosa.effects.harmonic(y)
-            chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr)
+            # smear the note profile; median over time beats mean for noise.
+            # (hpss on the stft is much faster than librosa.effects.harmonic) ---
+            stft = librosa.stft(y, n_fft=2048, hop_length=1024)
+            harm, _ = librosa.decompose.hpss(stft)
+            y_harm = librosa.istft(harm, hop_length=1024)
+            chroma = librosa.feature.chroma_stft(y=y_harm, sr=sr,
+                                                 hop_length=1024)
             chroma = np.median(chroma, axis=1)
             maj = np.array(self.MAJ)
             minor = np.array(self.MIN)
@@ -436,6 +449,9 @@ class AnalyzeWorker(QThread):
                     best_corr, best = cm, f"{self.KEYS[i]} major"
                 if ci > best_corr:
                     best_corr, best = ci, f"{self.KEYS[i]} minor"
+            print(f"[analyze] done in {time.time() - t0:.1f}s: "
+                  f"{bpm:.0f} BPM, {best} - {os.path.basename(self.path)}",
+                  file=sys.stderr)
             self.done.emit(self.path, bpm, best)
         except Exception:
             # visible in the terminal when run from source / console build
@@ -1509,11 +1525,15 @@ class LibraryTab(QWidget):
     # -- BPM / key analysis (one file at a time, in the background) --
     def _enqueue_analysis(self, entry):
         if not ANALYSIS_AVAILABLE:
+            print("[analyze] skipped: librosa is not installed", file=sys.stderr)
             return
         if not entry.get("file") or not os.path.exists(entry["file"]):
+            print(f"[analyze] skipped: file missing: {entry.get('file')}",
+                  file=sys.stderr)
             return
         if entry["file"] in [e.get("file") for e in self._analyze_queue]:
             return
+        print(f"[analyze] queued: {entry['file']}", file=sys.stderr)
         self._analyze_queue.append(entry)
         self._process_analysis()
 
@@ -2466,6 +2486,9 @@ def _load_app_icon():
 
 
 def main():
+    print(f"[beatpull] v{APP_VERSION} | analysis available: {ANALYSIS_AVAILABLE} "
+          f"| ffmpeg found: {shutil.which('ffmpeg') is not None}",
+          file=sys.stderr)
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
 

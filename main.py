@@ -62,7 +62,7 @@ ANALYSIS_AVAILABLE = importlib.util.find_spec("librosa") is not None
 # when it pulls an update, this constant is always the true running version —
 # whether launched from the exe or run directly with `python main.py`.
 # Bump it together with version.json on every release.
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.11"
 
 
 def app_version():
@@ -219,6 +219,15 @@ class DownloadWorker(QThread):
             base = os.path.join(self.out_dir, info.get("title", "track"))
             media_path = f"{base}.{self.fmt}"
 
+        # For extracted audio (mp3/wav), yt-dlp sometimes reports the
+        # pre-conversion path (e.g. ".webm") which gets deleted after ffmpeg
+        # converts it. Point at the real converted file instead - otherwise
+        # the entry references a ghost file and BPM/key analysis skips it.
+        if self.fmt in ("mp3", "wav"):
+            want = os.path.splitext(media_path)[0] + "." + self.fmt
+            if os.path.exists(want):
+                media_path = want
+
         stem = os.path.splitext(media_path)[0]
         thumb_path = ""
         for ext in (".jpg", ".jpeg", ".png", ".webp"):
@@ -351,19 +360,55 @@ class AnalyzeWorker(QThread):
         super().__init__()
         self.path = path
 
+    def _load_audio(self, librosa):
+        """Load audio for analysis. librosa often can't read video containers
+        (mp4/webm) directly, so on failure fall back to extracting the audio
+        with ffmpeg into a temp wav and analyzing that."""
+        try:
+            total = 0
+            try:
+                total = librosa.get_duration(path=self.path)
+            except Exception:
+                pass
+            offset = 30.0 if total and total > 150 else 0.0
+            y, sr = librosa.load(self.path, mono=True, sr=22050,
+                                 offset=offset, duration=120)
+            if y is not None and len(y) > sr * 3:
+                return y, sr
+        except Exception:
+            pass
+        # ffmpeg fallback (works for any container ffmpeg understands)
+        import subprocess
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-ss", "30", "-i", self.path, "-t", "120",
+                 "-vn", "-ac", "1", "-ar", "22050", tmp.name],
+                capture_output=True, timeout=120,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            y, sr = librosa.load(tmp.name, mono=True, sr=22050)
+            if y is None or len(y) < sr * 3:
+                # song may be shorter than the 30s skip - try from the start
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", self.path, "-t", "120",
+                     "-vn", "-ac", "1", "-ar", "22050", tmp.name],
+                    capture_output=True, timeout=120,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                y, sr = librosa.load(tmp.name, mono=True, sr=22050)
+            return y, sr
+        finally:
+            try:
+                os.remove(tmp.name)
+            except Exception:
+                pass
+
     def run(self):
         try:
             import librosa
             import numpy as np
-            # Skip the intro and analyze the body of the song - intros are
-            # often ambiguous (no drums yet, pad chords, etc.)
-            try:
-                total = librosa.get_duration(path=self.path)
-            except Exception:
-                total = 0
-            offset = 30.0 if total and total > 150 else 0.0
-            y, sr = librosa.load(self.path, mono=True, sr=22050,
-                                 offset=offset, duration=120)
+            y, sr = self._load_audio(librosa)
 
             # --- BPM: median onset strength is robust to noise, and fold
             # half/double-time results into the sensible 70-180 range ---
@@ -393,6 +438,10 @@ class AnalyzeWorker(QThread):
                     best_corr, best = ci, f"{self.KEYS[i]} minor"
             self.done.emit(self.path, bpm, best)
         except Exception:
+            # visible in the terminal when run from source / console build
+            import traceback
+            print(f"[analyze] failed for {self.path}:", file=sys.stderr)
+            traceback.print_exc()
             self.done.emit(self.path, 0.0, "")
 
 

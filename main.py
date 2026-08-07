@@ -62,7 +62,7 @@ ANALYSIS_AVAILABLE = importlib.util.find_spec("librosa") is not None
 # when it pulls an update, this constant is always the true running version —
 # whether launched from the exe or run directly with `python main.py`.
 # Bump it together with version.json on every release.
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.9"
 
 
 def app_version():
@@ -182,6 +182,13 @@ class DownloadWorker(QThread):
                 "preferredcodec": "mp3",
                 "preferredquality": self.quality,
             })
+        elif self.fmt == "wav":
+            # lossless - no quality setting applies
+            opts["format"] = "bestaudio/best"
+            opts["postprocessors"].append({
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "wav",
+            })
         else:
             h = self.quality
             opts["format"] = (
@@ -192,8 +199,10 @@ class DownloadWorker(QThread):
         # jpg thumbnail
         opts["postprocessors"].append(
             {"key": "FFmpegThumbnailsConvertor", "format": "jpg"})
-        opts["postprocessors"].append(
-            {"key": "EmbedThumbnail", "already_have_thumbnail": True})
+        # WAV files can't hold embedded cover art, so skip embedding for them
+        if self.fmt != "wav":
+            opts["postprocessors"].append(
+                {"key": "EmbedThumbnail", "already_have_thumbnail": True})
         opts["postprocessors"].append(
             {"key": "FFmpegMetadata", "add_metadata": True})
         return opts
@@ -346,11 +355,32 @@ class AnalyzeWorker(QThread):
         try:
             import librosa
             import numpy as np
-            y, sr = librosa.load(self.path, mono=True, duration=90)
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-            bpm = float(round(float(np.atleast_1d(tempo)[0])))
+            # Skip the intro and analyze the body of the song - intros are
+            # often ambiguous (no drums yet, pad chords, etc.)
+            try:
+                total = librosa.get_duration(path=self.path)
+            except Exception:
+                total = 0
+            offset = 30.0 if total and total > 150 else 0.0
+            y, sr = librosa.load(self.path, mono=True, sr=22050,
+                                 offset=offset, duration=120)
 
-            chroma = librosa.feature.chroma_cqt(y=y, sr=sr).mean(axis=1)
+            # --- BPM: median onset strength is robust to noise, and fold
+            # half/double-time results into the sensible 70-180 range ---
+            onset = librosa.onset.onset_strength(y=y, sr=sr, aggregate=np.median)
+            tempo, _ = librosa.beat.beat_track(onset_envelope=onset, sr=sr)
+            bpm = float(np.atleast_1d(tempo)[0])
+            while 0 < bpm < 70:
+                bpm *= 2
+            while bpm > 180:
+                bpm /= 2
+            bpm = float(round(bpm))
+
+            # --- Key: analyze only the harmonic (melodic) part so drums don't
+            # smear the note profile; median over time beats mean for noise ---
+            y_harm = librosa.effects.harmonic(y)
+            chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr)
+            chroma = np.median(chroma, axis=1)
             maj = np.array(self.MAJ)
             minor = np.array(self.MIN)
             best_corr, best = -2.0, ""
@@ -473,10 +503,11 @@ class DownloadTab(QWidget):
         fbox.setSpacing(6)
         fbox.addWidget(self._label("Format"))
         self.fmt_select = QComboBox()
-        self.fmt_select.addItems(["MP3 (audio)", "MP4 (video)"])
+        self.fmt_select.addItems(["MP3 (audio)", "MP4 (video)", "WAV (audio)"])
         self.fmt_select.setMinimumWidth(150)
-        if SETTINGS.get("format") == "mp4":
-            self.fmt_select.setCurrentIndex(1)
+        saved_fmt = SETTINGS.get("format", "mp3")
+        self.fmt_select.setCurrentIndex(
+            {"mp3": 0, "mp4": 1, "wav": 2}.get(saved_fmt, 0))
         self.fmt_select.currentIndexChanged.connect(self._on_format_change)
         fbox.addWidget(self.fmt_select)
         row.addLayout(fbox, 1)
@@ -489,10 +520,11 @@ class DownloadTab(QWidget):
         row.addLayout(qbox, 1)
         cl.addLayout(row)
         self._on_format_change(self.fmt_select.currentIndex())
-        q = SETTINGS.get("quality_mp4" if SETTINGS.get("format") == "mp4"
-                         else "quality_mp3")
-        if q:
-            self.qual_select.setCurrentText(q)
+        if saved_fmt in ("mp3", "mp4"):
+            q = SETTINGS.get("quality_mp4" if saved_fmt == "mp4"
+                             else "quality_mp3")
+            if q:
+                self.qual_select.setCurrentText(q)
 
         cl.addWidget(self._label("Save to"))
         frow = QHBoxLayout()
@@ -581,12 +613,17 @@ class DownloadTab(QWidget):
 
     def _on_format_change(self, idx):
         self.qual_select.clear()
-        if idx == 0:
+        if idx == 0:      # mp3
             self.qual_select.addItems(["320", "256", "192", "128"])
             self.qual_select.setCurrentText("192")
-        else:
+            self.qual_select.setEnabled(True)
+        elif idx == 1:    # mp4
             self.qual_select.addItems(["2160", "1440", "1080", "720", "480"])
             self.qual_select.setCurrentText("1080")
+            self.qual_select.setEnabled(True)
+        else:             # wav - lossless, no quality choice
+            self.qual_select.addItems(["Lossless"])
+            self.qual_select.setEnabled(False)
 
     def _choose_folder(self):
         path = QFileDialog.getExistingDirectory(self, "Choose folder", self.out_dir)
@@ -606,11 +643,12 @@ class DownloadTab(QWidget):
             self._log("Please paste a link first.")
             return
         urls = [u for u in raw.replace(",", " ").split() if u]
-        fmt = "mp3" if self.fmt_select.currentIndex() == 0 else "mp4"
+        fmt = {0: "mp3", 1: "mp4", 2: "wav"}[self.fmt_select.currentIndex()]
         quality = self.qual_select.currentText()
         # remember choices for next time
         SETTINGS["format"] = fmt
-        SETTINGS["quality_mp3" if fmt == "mp3" else "quality_mp4"] = quality
+        if fmt in ("mp3", "mp4"):
+            SETTINGS["quality_mp3" if fmt == "mp3" else "quality_mp4"] = quality
         SETTINGS["out_dir"] = self.out_dir
         save_settings(SETTINGS)
 
@@ -754,9 +792,13 @@ class TrackRow(QFrame):
         ren.triggered.connect(lambda: self.owner.rename_track(self.entry))
         menu.addAction(ren)
 
-        analyze = QAction("Analyze BPM & key", self)
+        analyze = QAction("Re-analyze BPM & key", self)
         analyze.triggered.connect(lambda: self.owner.analyze_entry(self.entry))
         menu.addAction(analyze)
+
+        editbk = QAction("Edit BPM & key…", self)
+        editbk.triggered.connect(lambda: self.owner.edit_bpm_key(self.entry))
+        menu.addAction(editbk)
 
         menu.addSeparator()
         dele = QAction("Remove from library", self)
@@ -1465,6 +1507,37 @@ class LibraryTab(QWidget):
             return
         self._enqueue_analysis(entry)
 
+    def edit_bpm_key(self, entry):
+        """Manually set BPM and key for a track (overrides detection)."""
+        bpm, ok = QInputDialog.getInt(
+            self, "Edit BPM", "BPM:", int(entry.get("bpm") or 120), 20, 300)
+        if not ok:
+            return
+        keys = ["(none)"] + [
+            f"{n} {m}" for m in ("major", "minor")
+            for n in ["C", "C#", "D", "D#", "E", "F",
+                      "F#", "G", "G#", "A", "A#", "B"]]
+        current = entry.get("key") or "(none)"
+        idx = keys.index(current) if current in keys else 0
+        key, ok2 = QInputDialog.getItem(
+            self, "Edit key", "Key:", keys, idx, False)
+        if not ok2:
+            return
+        key = "" if key == "(none)" else key
+        for t in self.store["tracks"]:
+            if self._same_track(t, entry):
+                t["bpm"] = float(bpm)
+                t["key"] = key
+                break
+        entry["bpm"] = float(bpm)
+        entry["key"] = key
+        save_store(self.store)
+        for row in self.rows:
+            if row.entry.get("file") == entry.get("file"):
+                row.entry["bpm"] = float(bpm)
+                row.entry["key"] = key
+                row.update_meta()
+
     def add_category(self, name):
         name = name.strip()
         if name and name not in self.store["categories"]:
@@ -1986,8 +2059,9 @@ class SettingsTab(QWidget):
 
         cl.addWidget(self._label("Default format"))
         self.fmt = QComboBox()
-        self.fmt.addItems(["MP3 (audio)", "MP4 (video)"])
-        self.fmt.setCurrentIndex(1 if SETTINGS.get("format") == "mp4" else 0)
+        self.fmt.addItems(["MP3 (audio)", "MP4 (video)", "WAV (audio)"])
+        self.fmt.setCurrentIndex(
+            {"mp3": 0, "mp4": 1, "wav": 2}.get(SETTINGS.get("format", "mp3"), 0))
         self.fmt.currentIndexChanged.connect(self._save_format)
         cl.addWidget(self.fmt)
 
@@ -2026,7 +2100,7 @@ class SettingsTab(QWidget):
             self.app.download_tab.folder_label.setText(path)
 
     def _save_format(self, idx):
-        SETTINGS["format"] = "mp4" if idx == 1 else "mp3"
+        SETTINGS["format"] = {0: "mp3", 1: "mp4", 2: "wav"}.get(idx, "mp3")
         save_settings(SETTINGS)
 
     def _toggle_reduce(self, on):

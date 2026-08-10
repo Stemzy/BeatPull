@@ -1555,16 +1555,22 @@ class LibraryTab(QWidget):
 
     def _on_analyzed(self, path, bpm, key):
         if bpm:
+            hits = 0
             for t in self.store["tracks"]:
                 if t.get("file") == path:
                     t["bpm"] = bpm
                     t["key"] = key
+                    hits += 1
             save_store(self.store)
+            row_hits = 0
             for row in self.rows:
                 if row.entry.get("file") == path:
                     row.entry["bpm"] = bpm
                     row.entry["key"] = key
                     row.update_meta()
+                    row_hits += 1
+            print(f"[analyze] saved: store matches={hits}, "
+                  f"visible rows updated={row_hits}", file=sys.stderr)
         self._analyzing = False
         self._process_analysis()
 

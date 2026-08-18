@@ -62,7 +62,7 @@ ANALYSIS_AVAILABLE = importlib.util.find_spec("librosa") is not None
 # when it pulls an update, this constant is always the true running version —
 # whether launched from the exe or run directly with `python main.py`.
 # Bump it together with version.json on every release.
-APP_VERSION = "1.0.13"
+APP_VERSION = "1.0.15"
 
 
 def app_version():
@@ -137,6 +137,22 @@ def fmt_time(ms):
         return "0:00"
     s = ms // 1000
     return f"{s // 60}:{s % 60:02d}"
+
+
+# Silent logger so yt-dlp's per-attempt errors don't spam the console while we
+# retry with different strategies. Only our own log messages show.
+class _QuietLogger:
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        pass
 
 
 # Worker: downloads on a background thread and also grabs a thumbnail + info
@@ -285,14 +301,52 @@ class DownloadWorker(QThread):
             "playlist": playlist,
         }
 
+    # Ways to get around YouTube 403 blocks, tried in order until one works.
+    # Lead with alternate player clients (least likely to 403), then browser
+    # cookies as a last resort.
+    _STRATEGIES = [
+        ("android client",
+         {"extractor_args": {"youtube": {"player_client": ["android", "web_safari"]}}}),
+        ("tv client",
+         {"extractor_args": {"youtube": {"player_client": ["tv", "mweb"]}}}),
+        ("default", {}),
+        ("chrome cookies", {"cookiesfrombrowser": ("chrome",)}),
+        ("edge cookies", {"cookiesfrombrowser": ("edge",)}),
+        ("firefox cookies", {"cookiesfrombrowser": ("firefox",)}),
+    ]
+
+    def _extract(self, url):
+        """Try each strategy until the download succeeds. Retries only on the
+        auth/403 style errors that alternate clients or cookies can fix."""
+        last = None
+        for i, (name, extra) in enumerate(self._STRATEGIES):
+            opts = self._options()
+            opts["ignoreerrors"] = False   # so failures raise and we can retry
+            opts["logger"] = _QuietLogger()  # don't spam the first-try errors
+            opts.update(extra)
+            try:
+                if i > 0:
+                    self.log.emit(f"Retrying with {name}…")
+                with YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(url, download=True)
+            except Exception as e:  # noqa: BLE001
+                last = e
+                msg = str(e).lower()
+                retryable = any(s in msg for s in (
+                    "403", "forbidden", "sign in", "cookies", "unable to download",
+                    "please sign in", "confirm your age", "precondition"))
+                if retryable:
+                    continue
+                raise
+        raise last if last else RuntimeError("download failed")
+
     def run(self):
         added = 0
         for idx, url in enumerate(self.urls):
             try:
                 self.log.emit(f"[{idx + 1}/{len(self.urls)}] Fetching…")
                 self.progress.emit(0.0)
-                with YoutubeDL(self._options()) as ydl:
-                    info = ydl.extract_info(url, download=True)
+                info = self._extract(url)
                 if info is None:
                     self.failed.emit(f"{url}: nothing downloaded")
                     continue
@@ -1533,6 +1587,8 @@ class LibraryTab(QWidget):
             return
         if entry["file"] in [e.get("file") for e in self._analyze_queue]:
             return
+        if entry["file"] == getattr(self, "_current_analysis", None):
+            return   # this exact file is being analyzed right now
         print(f"[analyze] queued: {entry['file']}", file=sys.stderr)
         self._analyze_queue.append(entry)
         self._process_analysis()
@@ -1542,6 +1598,7 @@ class LibraryTab(QWidget):
             return
         entry = self._analyze_queue.pop(0)
         self._analyzing = True
+        self._current_analysis = entry["file"]
         worker = AnalyzeWorker(entry["file"])
         self._analyze_workers.append(worker)
         worker.done.connect(self._on_analyzed)
@@ -1572,6 +1629,7 @@ class LibraryTab(QWidget):
             print(f"[analyze] saved: store matches={hits}, "
                   f"visible rows updated={row_hits}", file=sys.stderr)
         self._analyzing = False
+        self._current_analysis = None
         self._process_analysis()
 
     def analyze_entry(self, entry):
